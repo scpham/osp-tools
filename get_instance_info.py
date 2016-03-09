@@ -1,21 +1,25 @@
 #!/usr/bin/env python
 # coding=utf-8
+__author__ = "Scott Pham"
+__version__ = "0.1"
+__maintainer__ = "Scott Pham"
+__email__ = "scpham@cisco.com"
+
 import argparse
-from copy import deepcopy
 import json
 import logging
 import os
-import time
-import ansible.runner
-import ansible.inventory
+from copy import deepcopy
 
-from prettytable import PrettyTable
-from novaclient import client as nova_client
+import ansible.inventory
+import ansible.runner
 from neutronclient.v2_0 import client as neutron_client
+from novaclient import client as nova_client
+from prettytable import PrettyTable
+
 # noinspection PyPep8Naming
 from glanceclient import Client as glance_client
 from keystoneclient.v2_0 import client as keystone_client
-from neutronclient.neutron.v2_0 import agentscheduler
 
 logging.basicConfig(date_fmt='%m-%d %H:%M')
 LOG = logging.getLogger('InstanceInfo')
@@ -259,10 +263,12 @@ class NovaInstance(object):
 
             # Get Router Info
             router = self.get_router_associated_with_instance(routers, port['fixed_ips'][0]['subnet_id'])
+            router_ip = None
             for router_id in router.keys():
+                router_ip = router[router_id]['ip_address']
                 neutron_pt.add_row(['Router ID', router_id])
                 neutron_pt.add_row(['Router Net Node', "%s (%s)" % (
-                    router[router_id]['network_node'].split('.')[0], router[router_id]['ip_address'])])
+                    router[router_id]['network_node'].split('.')[0], router_ip)])
 
             # Get Security Group Info
             is_pingable = False
@@ -278,11 +284,13 @@ class NovaInstance(object):
 
             # Get DHCP Agent Logs for Mac
             if self.dhcp_logs and dhcp_agent_ports.keys():
-                self.get_dhcp_logs(network_nodes=dhcp_agent_ports.keys(), mac=port['mac_address'])
+                self.get_dhcp_logs(network_nodes=dhcp_agent_ports.keys(), mac=port['mac_address'],
+                                   network_id=port['network_id'])
 
             if self.dhcp_ping_test and dhcp_agent_ports.keys():
                 self.get_dhcp_ping_test(network_node_ports=dhcp_agent_ports, network_id=port['network_id'],
-                                        instance_ip=port['fixed_ips'][0]['ip_address'], is_pingable=is_pingable)
+                                        instance_ip=port['fixed_ips'][0]['ip_address'], router_ip=router_ip,
+                                        is_pingable=is_pingable)
 
     @staticmethod
     def get_compute_ovs_data(compute_node, vlan, ovs_port):
@@ -342,11 +350,13 @@ class NovaInstance(object):
             print brctl_table
 
     @staticmethod
-    def get_dhcp_logs(network_nodes, mac):
+    def get_dhcp_logs(network_nodes, mac, network_id):
         """Get DHCP Logs From Network Node"""
 
+        dhcp_namespace = "qdhcp-%s" % network_id
         dhcp_agent_inventory = ansible.inventory.Inventory(network_nodes)
-        dhcp_logs_command = "grep -w %s /var/log/messages | grep -v ansible-command | tail -5" % mac
+        dhcp_logs_command = "(echo '***** %s [ip a] ******';ip netns exec %s ip a); (echo '******************** DHCP LOGS *********************'; grep -w %s /var/log/messages | grep -v ansible-command | tail -5)" % (
+            dhcp_namespace, dhcp_namespace, mac)
 
         runner = ansible.runner.Runner(
             module_name='shell',
@@ -362,7 +372,7 @@ class NovaInstance(object):
                 if line != "":
                     dhcp_log.append(line)
 
-            dhcp_header = "DHCP Log on host [%s] for Mac Address: %s" % (agent, mac)
+            dhcp_header = "DHCP Data on host [%s] for Mac Address: %s" % (agent, mac)
             dhcp_table = PrettyTable([dhcp_header])
 
             dhcp_table.align[dhcp_header] = "l"
@@ -371,7 +381,7 @@ class NovaInstance(object):
             print dhcp_table
 
     @staticmethod
-    def get_dhcp_ping_test(network_node_ports, network_id, is_pingable, instance_ip):
+    def get_dhcp_ping_test(network_node_ports, network_id, is_pingable, instance_ip, router_ip):
         """DHCP Ping Test Across Namespaces and Instance"""
 
         dhcp_agent_ips = network_node_ports.values()
@@ -391,16 +401,22 @@ class NovaInstance(object):
                 agent_ip = ip
                 break
 
-        dhcp_ping_test_command = "(echo '***** %s [ip a] ******';ip netns exec %s ip a);( echo '****** Ping Test Between Net Nodes inside namespace [%s (%s) -> %s (%s)] ******'; ip netns exec %s ping -c 1 %s)" \
-                                 % (dhcp_namespace, dhcp_namespace, net_node, network_node_ports[net_node],
+        dhcp_ping_test_command = "( echo '****** Ping Test Between Net Nodes inside namespace [%s (%s) -> %s (%s)] ******'; ip netns exec %s ping -c 1 %s )" \
+                                 % (net_node, network_node_ports[net_node],
                                     ip_to_agent[agent_ip], agent_ip, dhcp_namespace,
                                     agent_ip)
 
+        if router_ip is not None:
+            dhcp_ping_test_command = "%s; ( echo '****** Router Ping Test %s [%s -> ping -c 1 %s] ******'; ip netns exec %s ping -c 1 %s )" % (
+                dhcp_ping_test_command, dhcp_namespace, net_node, router_ip, dhcp_namespace, router_ip)
+            dhcp_ping_test_command = "%s; (echo '****** External Ping Test %s [%s -> ping -c 1 8.8.8.8] ******'; ip netns exec %s ping -c 1 8.8.8.8 )" % (
+                dhcp_ping_test_command, dhcp_namespace, net_node, dhcp_namespace)
+
         if is_pingable:
-            dhcp_ping_test_command = "%s; ( echo '***** Instance Ping Test [ping -c 1 %s] *****'; ip netns exec %s ping -c 1 %s)" % (
-                dhcp_ping_test_command, instance_ip, dhcp_namespace, instance_ip)
+            dhcp_ping_test_command = "%s; ( echo '***** Instance Ping Test %s [%s -> ping -c 1 %s] *****'; ip netns exec %s ping -c 1 %s )" % (
+                dhcp_ping_test_command, dhcp_namespace, net_node, instance_ip, dhcp_namespace, instance_ip)
         else:
-            pt = PrettyTable(["Instance Security Group Rules Prevents Instance Ping Test.. Skipping.."])
+            pt = PrettyTable(["Instance Security Group Rules Prevents Instance Ping Test.. Skipping..."])
             print pt
 
         LOG.debug(dhcp_ping_test_command)
@@ -451,8 +467,9 @@ if __name__ == '__main__':
                         default=False, help='allow connections to SSL sites '
                                             'without certs')
     parser.add_argument('--ovs-data', dest='ovs_data', action='store_true', help="Grab OVS data from compute node")
-    parser.add_argument('--dhcp-logs', dest='dhcp_logs', action='store_true', help="Grab DHCP Logs for Instance MAC")
-    parser.add_argument('--dhcp-ping-test', dest='dhcp_ping_test', action='store_true',
+    parser.add_argument('--dhcp-logs', '--dhcp-data', dest='dhcp_logs', action='store_true',
+                        help="Grab DHCP Logs for Instance MAC")
+    parser.add_argument('--dhcp-ping-test', '--ping-test', dest='dhcp_ping_test', action='store_true',
                         help="Performs Ping Test inside DHCP Namespace")
 
     args = parser.parse_args()
