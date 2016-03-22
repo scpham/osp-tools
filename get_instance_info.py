@@ -305,18 +305,38 @@ class NovaInstance(object):
             if self.ovs_data:
                 self.get_compute_ovs_data(compute_node, network_vlan, ovs_port)
 
+            jobs_not_performed = []
             # Get DHCP Agent Logs for Mac
             if self.dhcp_logs and dhcp_agent_ports.keys():
                 self.get_dhcp_logs(network_nodes=dhcp_agent_ports.keys(), mac=instance_data['mac'],
                                    network_id=port['network_id'])
+            elif not dhcp_agent_ports.keys() and self.dhcp_logs:
+                jobs_not_performed.append('DHCP Logs')
 
+            # DHCP Ping Test
             if self.dhcp_ping_test and dhcp_agent_ports.keys():
                 self.get_dhcp_ping_test(network_node_ports=dhcp_agent_ports, network_id=port['network_id'],
                                         instance_ip=instance_data['ip_address'], router_ip=router_ip,
                                         is_pingable=is_pingable)
+            elif not dhcp_agent_ports.keys() and self.dhcp_ping_test:
+                jobs_not_performed.append('DHCP Ping Test')
+
+            # Tcpdump capture
             if self.capture_tcpdump and dhcp_agent_ports.keys():
                 self.run_tcpdump(net_nodes=dhcp_agent_ports, compute_node=compute_node, instance=instance_data,
                                  ovs_port=ovs_port, network_id=port['network_id'])
+            elif not dhcp_agent_ports.keys() and self.capture_tcpdump:
+                jobs_not_performed.append('Tcpdump Capture')
+
+            if jobs_not_performed:
+                header = 'Jobs that will not be performed due to no dhcp agents found'
+                jobs_not_performed_table = PrettyTable([header])
+                jobs_not_performed_table.align[header] = "c"
+                for job in  jobs_not_performed:
+                    jobs_not_performed_table.add_row([job])
+
+                print jobs_not_performed_table
+
 
     @staticmethod
     def get_compute_ovs_data(compute_node, vlan, ovs_port):
