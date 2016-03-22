@@ -9,7 +9,9 @@ import argparse
 import json
 import logging
 import os
+import threading
 from copy import deepcopy
+from time import sleep
 
 import ansible.inventory
 import ansible.runner
@@ -36,7 +38,10 @@ class NovaInstance(object):
         self._keystone = keystone_client.Client(**args)
 
         glance_endpoint = self._keystone.service_catalog.url_for(service_type='image', endpoint_type='internalURL')
-        self._neutron = neutron_client.Client(**args)
+        neutron_endpoint = self._keystone.service_catalog.url_for(service_type='network', endpoint_type='internalURL')
+        nova_endpoint = self._keystone.service_catalog.url_for(service_type='compute', endpoint_type='internalURL')
+        self._neutron = neutron_client.Client(endpoint_url=neutron_endpoint, token=self._keystone.auth_token)
+
         self._glance = glance_client('2', glance_endpoint, token=self._keystone.auth_token)
         self.debug = args.pop('debug')
         if self.debug:
@@ -44,10 +49,12 @@ class NovaInstance(object):
         self.ovs_data = args.pop('ovs_data')
         self.dhcp_logs = args.pop('dhcp_logs')
         self.dhcp_ping_test = args.pop('dhcp_ping_test')
+        self.capture_tcpdump = args.pop('capture_tcpdump')
         nova_args = deepcopy(args)
         self._nova = nova_client.Client('2', nova_args.pop('username'),
                                         nova_args.pop('password'),
-                                        nova_args.pop('tenant_name'), **nova_args)
+                                        auth_token=self._keystone.auth_token,
+                                        project_id=nova_args.pop('tenant_name'), **nova_args)
 
     def get_instance_neutron_port_list(self, instance_uuid):
         """Get Neutron Ports (neutron port-show)"""
@@ -71,6 +78,7 @@ class NovaInstance(object):
         """Get Routers Associated with Instance"""
 
         filtered_routers = {}
+
         for router in routers['routers']:
             router_ports = self._neutron.list_ports(device_id=router['id'])
             if self.debug:
@@ -83,6 +91,8 @@ class NovaInstance(object):
                     if fip['subnet_id'] == subnet_id:
                         filtered_routers[rp['device_id']] = {'network_node': router_net_node,
                                                              'ip_address': fip['ip_address']}
+                        # return if router found
+                        return filtered_routers
 
         return filtered_routers
 
@@ -168,7 +178,13 @@ class NovaInstance(object):
 
         agents_port = {}
         for port in dhcp_ports['ports']:
-            agents_port[port['binding:host_id'].split('.')[0]] = port['fixed_ips'][0]['ip_address']
+            hostname = port['binding:host_id'].split('.')[0]
+
+            if hostname not in agents_port:
+                agents_port[hostname] = {}
+
+            agents_port[hostname]['ip_address'] = port['fixed_ips'][0]['ip_address']
+            agents_port[hostname]['mac_address'] = port['mac_address']
 
         self.data_dump(agents_port)
 
@@ -197,8 +213,12 @@ class NovaInstance(object):
 
     def get_glance_image(self, image_id):
         """Get Glance Image Details"""
+        image = {}
+        try:
+            image = self._glance.images.get(image_id)
+        except:
+            image['name'] = 'Image Not Found (Deleted)'
 
-        image = self._glance.images.get(image_id)
         return image['name']
 
     def print_instance_info(self, uuid):
@@ -219,7 +239,7 @@ class NovaInstance(object):
                 instance_pt.add_row(['Tenant ID', instance['tenant_id']])
                 instance_pt.add_row(['Tenant Name', tenant_name])
             elif field == 'image':
-                if instance[field] == "Image Not Found":
+                if instance[field] == "Image Not Found (Deleted)":
                     instance_pt.add_row(['Image', instance[field]])
                 else:
                     image_name = self.get_glance_image(instance['image'])
@@ -232,14 +252,17 @@ class NovaInstance(object):
         # Print Port Info
         ports = self.get_instance_neutron_port_list(instance_uuid=uuid)
 
+        instance_data = {}
         for port in ports:
             neutron_pt = PrettyTable(['Interface', 'Data'])
             neutron_pt.align['Data'] = "l"
             ovs_port = port['id'][:11]
+            instance_data['mac'] = port['mac_address']
+            instance_data['ip_address'] = port['fixed_ips'][0]['ip_address']
             neutron_pt.add_row(['Network ID', port['network_id']])
             neutron_pt.add_row(['Subnet ID', port['fixed_ips'][0]['subnet_id']])
-            neutron_pt.add_row(['IP Address', port['fixed_ips'][0]['ip_address']])
-            neutron_pt.add_row(['MAC Address', port['mac_address']])
+            neutron_pt.add_row(['IP Address', instance_data['ip_address']])
+            neutron_pt.add_row(['MAC Address', instance_data['mac']])
 
             # Get Floating IP Info
             floating_ip = self.get_instance_floatingip(port['id'])
@@ -253,7 +276,7 @@ class NovaInstance(object):
             dhcp_agents_line = []
             dhcp_agent_ports = self.get_dhcp_agent_ports(network_id=port['network_id'], tenant_id=instance['tenant_id'])
             for agent in dhcp_agent_ports.keys():
-                dhcp_agents_line.append("%s (%s)" % (agent, dhcp_agent_ports[agent]))
+                dhcp_agents_line.append("%s (%s)" % (agent, dhcp_agent_ports[agent]['ip_address']))
             neutron_pt.add_row(['DHCP Agents', '\n'.join(dhcp_agents_line)])
 
             neutron_pt.add_row(['OVS Port', ovs_port])
@@ -284,13 +307,16 @@ class NovaInstance(object):
 
             # Get DHCP Agent Logs for Mac
             if self.dhcp_logs and dhcp_agent_ports.keys():
-                self.get_dhcp_logs(network_nodes=dhcp_agent_ports.keys(), mac=port['mac_address'],
+                self.get_dhcp_logs(network_nodes=dhcp_agent_ports.keys(), mac=instance_data['mac'],
                                    network_id=port['network_id'])
 
             if self.dhcp_ping_test and dhcp_agent_ports.keys():
                 self.get_dhcp_ping_test(network_node_ports=dhcp_agent_ports, network_id=port['network_id'],
-                                        instance_ip=port['fixed_ips'][0]['ip_address'], router_ip=router_ip,
+                                        instance_ip=instance_data['ip_address'], router_ip=router_ip,
                                         is_pingable=is_pingable)
+            if self.capture_tcpdump and dhcp_agent_ports.keys():
+                self.run_tcpdump(net_nodes=dhcp_agent_ports, compute_node=compute_node, instance=instance_data,
+                                 ovs_port=ovs_port, network_id=port['network_id'])
 
     @staticmethod
     def get_compute_ovs_data(compute_node, vlan, ovs_port):
@@ -384,25 +410,28 @@ class NovaInstance(object):
     def get_dhcp_ping_test(network_node_ports, network_id, is_pingable, instance_ip, router_ip):
         """DHCP Ping Test Across Namespaces and Instance"""
 
-        dhcp_agent_ips = network_node_ports.values()
         dhcp_namespace = "qdhcp-%s" % network_id
 
         ip_to_agent = {}
+        dhcp_agent_ips = []
         # TODO: Do this within 1 loop
         for agent in network_node_ports.keys():
-            ip_to_agent[network_node_ports[agent]] = agent
+            ip_to_agent[network_node_ports[agent]['ip_address']] = agent
+            dhcp_agent_ips.append(network_node_ports[agent]['ip_address'])
 
         net_node = None
         agent_ip = None
         for agent in network_node_ports.keys():
             ip = dhcp_agent_ips.pop()
-            if network_node_ports[agent] != ip:
+            if network_node_ports[agent]['ip_address'] != ip:
+                # net_node = ping from network node (source)
+                # agent_ip = ping destination ip
                 net_node = agent
                 agent_ip = ip
                 break
 
         dhcp_ping_test_command = "( echo '****** Ping Test Between Net Nodes inside namespace [%s (%s) -> %s (%s)] ******'; ip netns exec %s ping -c 1 %s )" \
-                                 % (net_node, network_node_ports[net_node],
+                                 % (net_node, network_node_ports[net_node]['ip_address'],
                                     ip_to_agent[agent_ip], agent_ip, dhcp_namespace,
                                     agent_ip)
 
@@ -453,6 +482,110 @@ class NovaInstance(object):
         """Pretty Print JSON Data Structures"""
         LOG.debug(json.dumps(data, sort_keys=True, indent=4, separators=(',', ': ')))
 
+    def run_tcpdump(self, net_nodes, compute_node, instance, ovs_port, network_id):
+        """ Run TCPDUMP on compute nodes using threads and queues"""
+
+        net_node = net_nodes.keys()[0]
+        dhcp_namespace_mac = net_nodes[net_node]['mac_address']
+        instance_mac = instance['mac']
+        instance_ip = instance['ip_address']
+        dhcp_namespace = "qdhcp-%s" % network_id
+
+        # get_instance_cmd = "ovs-vsctl list-ports br-ex | grep ^eth || ovs-appctl bond/show bond1 | sed -e '/active slave mac:/!d' -e 's/.*active slave mac: .*\(\(eth.\)\).*/\1/'"
+
+        # Tcpdump command for capturing compute ovs north bound
+        get_ovs_northbound_interface_cmd = "interface=$(ovs-vsctl list-ports br-ex | grep ^eth || ovs-appctl bond/show bond1 | awk '/active slave mac/ {print $4}'|awk -F\( '{print $2}'|sed -e 's#)##g')"
+        tcpdump_compute_ovs_interface_cmd = "%s; timeout 9 tcpdump -enni $interface '((ether src %s and ether dst %s and icmp))'" % (
+            get_ovs_northbound_interface_cmd, dhcp_namespace_mac, instance_mac)
+
+        # Tcpdump command for capturing network node ovs north bound
+        tcpdump_network_ovs_interface_cmd = "%s; timeout 7 tcpdump -enni $interface '((ether src %s and ether dst %s and icmp))'" % (
+            get_ovs_northbound_interface_cmd, dhcp_namespace_mac, instance_mac)
+
+        # Tcpdump command for tap interface
+        tcpdump_tap_interface_cmd = "timeout 13 tcpdump -enni tap%s '((ether src %s and ether dst %s and icmp))'" % (
+            ovs_port, dhcp_namespace_mac, instance_mac)
+
+        # Tcpdump command for qvo interface
+        tcpdump_qvo_interface_cmd = "timeout 11 tcpdump -enni qvo%s '((ether src %s and ether dst %s and icmp))'" % (
+            ovs_port, dhcp_namespace_mac, instance_mac)
+
+        # Ping Command
+        ping_instance_cmd = "ip netns exec %s ping -c 5 %s" % (dhcp_namespace, instance_ip)
+
+        # Tcpdump thread for OVS Bridge Interface
+        tcpdump_compute_ovs_thread = threading.Thread(name='Compute Node OVS Thread', target=self.get_tcpdump,
+                                                      args=(compute_node, tcpdump_compute_ovs_interface_cmd,
+                                                            'Compute Node OVS North Bound Interface TCPDUMP: [%s] tcpdump -enni {eth1,eth2} \'((ether src %s and ether dst %s and icmp))\'' % (
+                                                                compute_node, dhcp_namespace_mac, instance_mac)))
+
+        # Tcpdump thread for OVS Bridge Interface
+        tcpdump_network_ovs_thread = threading.Thread(name='Network Node OVS Thread', target=self.get_tcpdump,
+                                                      args=(net_node, tcpdump_network_ovs_interface_cmd,
+                                                            'Network Node OVS North Bound Interface TCPDUMP: [%s] tcpdump -enni {eth1,eth2} \'((ether src %s and ether dst %s and icmp))\'' % (
+                                                                net_node, dhcp_namespace_mac, instance_mac)))
+
+        # Tcpdump Thread for Tap interface
+        tcpdump_tap_interface_thread = threading.Thread(name="Tap Interface Thread", target=self.get_tcpdump,
+                                                        args=(compute_node, tcpdump_tap_interface_cmd,
+                                                              'TAP Interface TCPDUMP: [%s] %s' % (
+                                                                  compute_node, tcpdump_tap_interface_cmd)))
+
+        # Tcpdump thread for QVO Interface
+        tcpdump_qvo_interface_thread = threading.Thread(name='QVO Interface Thread', target=self.get_tcpdump, args=(
+            compute_node, tcpdump_qvo_interface_cmd,
+            "QVO Interface TCPDUMP: [%s] %s" % (compute_node, tcpdump_qvo_interface_cmd)))
+
+        # Ping Thread
+        ping_cmd_thread = threading.Thread(name='Ping Command Thread', target=self.get_tcpdump,
+                                           args=(net_node, ping_instance_cmd,
+                                                 'Ping Test for Tcpdump: [%s] %s' % (net_node, ping_instance_cmd)))
+
+        try:
+
+            tcpdump_network_ovs_thread.start()
+            tcpdump_compute_ovs_thread.start()
+
+            tcpdump_tap_interface_thread.start()
+            tcpdump_qvo_interface_thread.start()
+            sleep(2)
+            ping_cmd_thread.start()
+        except (KeyboardInterrupt, SystemExit):
+            print "Recieved shutdown signal"
+            tcpdump_tap_interface_thread.join(0)
+            tcpdump_compute_ovs_thread.join(0)
+            tcpdump_network_ovs_thread.join(0)
+            tcpdump_qvo_interface_thread.join(0)
+            ping_cmd_thread.join(0)
+
+    def get_tcpdump(self, host, command, header):
+        """Perform TCPDUMP on Compute Node and Capture it's data"""
+
+        runner = ansible.runner.Runner(
+            module_name='shell',
+            module_args=command,
+            pattern=host,
+        )
+
+        results = runner.run()
+
+        # Print Error For Host
+        for node in results['dark']:
+            dark_table = PrettyTable(["Failed to Contact Host [%s] with error" % node])
+            dark_table.align["Failed to Contact Host [%s] with error" % node] = "l"
+            dark_table.add_row([results['dark'][node]['msg']])
+            print dark_table
+
+        # Print Results of STDOUT
+        for node in results['contacted']:
+            lines = results['contacted'][node]['stdout'].split('\n')
+            results_table = PrettyTable([header])
+            # if 'Ping' in header:
+            results_table.align[header] = "l"
+            for i in lines:
+                results_table.add_row([i])
+            print results_table
+
 
 if __name__ == '__main__':
     # ensure environment has necessary items to authenticate
@@ -467,10 +600,12 @@ if __name__ == '__main__':
                         default=False, help='allow connections to SSL sites '
                                             'without certs')
     parser.add_argument('--ovs-data', dest='ovs_data', action='store_true', help="Grab OVS data from compute node")
-    parser.add_argument('--dhcp-logs', '--dhcp-data', dest='dhcp_logs', action='store_true',
+    parser.add_argument('--dhcp-logs', '--dhcp-data', '--logs', dest='dhcp_logs', action='store_true',
                         help="Grab DHCP Logs for Instance MAC")
     parser.add_argument('--dhcp-ping-test', '--ping-test', dest='dhcp_ping_test', action='store_true',
                         help="Performs Ping Test inside DHCP Namespace")
+    parser.add_argument('--capture-tcpdump', dest='capture_tcpdump', action='store_true',
+                        help="Runs TCP Dump on Compute node and captures it's output. This takes about 10 seconds to perform")
 
     args = parser.parse_args()
     os_args = dict(auth_url=os.environ.get('OS_AUTH_URL'),
@@ -483,8 +618,8 @@ if __name__ == '__main__':
                    debug=args.debug,
                    ovs_data=args.ovs_data,
                    dhcp_logs=args.dhcp_logs,
-                   dhcp_ping_test=args.dhcp_ping_test)
+                   dhcp_ping_test=args.dhcp_ping_test,
+                   capture_tcpdump=args.capture_tcpdump)
 
     nova_instance = NovaInstance(**os_args)
     nova_instance.print_instance_info(args.uuid)
-
