@@ -178,6 +178,10 @@ class NovaInstance(object):
 
         agents_port = {}
         for port in dhcp_ports['ports']:
+            # This is a workaround since sometimes the port information is incorrect
+            if port['device_id'] == 'reserved_dhcp_port' or port['status'] != 'ACTIVE':
+                continue
+
             hostname = port['binding:host_id'].split('.')[0]
 
             if hostname not in agents_port:
