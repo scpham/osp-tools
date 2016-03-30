@@ -21,7 +21,11 @@ import threading
 import Queue
 from subprocess import Popen, PIPE
 from time import sleep
-import click
+try:
+    import click
+    skip_progress_bar = 0
+except ImportError:
+    skip_progress_bar = 1
 import paramiko
 import logging
 
@@ -42,7 +46,9 @@ class CopyFu(object):
         logging.basicConfig(format=log_format)
         self.logger   = logging.getLogger('CopyFu')
         self.logger.setLevel(logging.INFO)
-        if kwargs.get('debug'):
+
+        self.debug = kwargs.get('debug')
+        if self.debug:
             self.logger.setLevel(logging.DEBUG)
 
         self.ssh_args = dict(
@@ -93,33 +99,39 @@ class CopyFu(object):
         pool = []
         last_item = self.queue[-1]
         for item in self.queue:
-            if self.blocks_remainder == 0 and last_item == item:
-                pool.append(threading.Thread(target=self.copy, args=(item,self.blocks_per_stream+1)))
+            if last_item == item:
+                pool.append(threading.Thread(target=self.copy, args=(item,)))
             else:
                 pool.append(threading.Thread(target=self.copy, args=(item,self.blocks_per_stream)))
 
-        with click.progressbar(length=len(self.queue*2),label="Copy Progress") as bar:
-
+        if self.debug or skip_progress_bar:
             for thread in pool:
                 thread.start()
                 # Need to throttle the ssh connections
                 sleep(1)
-                bar.next()
+        else:
+            with click.progressbar(length=len(self.queue*2),label="%s" % self.dest_file) as bar:
 
-            max_items = len(self.queue)
-            while True:
-                try:
-                    if max_items == 0:
-                        break
-                    blocks = self.progress_queue.get(True,0.05)
+                for thread in pool:
+                    thread.start()
+                    # Need to throttle the ssh connections
+                    sleep(1)
                     bar.next()
-                    max_items -= 1
-                except Queue.Empty:
-                    continue
+
+                max_items = len(self.queue)
+                while True:
+                    try:
+                        if max_items == 0:
+                            break
+                        self.progress_queue.get(True,0.05)
+                        bar.next()
+                        max_items -= 1
+                    except Queue.Empty:
+                        continue
 
 
 
-    def copy(self,offset, block_count):
+    def copy(self,offset, block_count=-1):
         """ Perform Copy Operation Based on Offset and Block Count"""
         ssh_client = paramiko.SSHClient()
         ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -134,9 +146,12 @@ class CopyFu(object):
         #read_cmd = "dd if=%s bs=4096 skip=%s count=%s | gzip -c | ssh 10.203.96.10 'gzip -dc | dd conv=notrunc of=%s bs=4096 seek=%s'" % (self.filename, offset, self.blocks_per_stream, self.dest_file, offset)
         #(cmdin,cmdout,cmderr) = os.popen3(read_cmd, 'r')
         # Read DD Process PIPED to gzip Process
-        read_dd_process = Popen(
-            ['dd', "if=%s" % self.filename, 'bs=4096', "skip=%s" % offset, "count=%s" % block_count],
-            stdout=PIPE, stderr=self.dev_null)
+        read_dd_cmd = ['dd', "if=%s" % self.filename, 'bs=4096', "skip=%s" % offset,]
+        if block_count != -1:
+            read_dd_cmd.append("count=%s" % block_count)
+
+
+        read_dd_process = Popen(read_dd_cmd,stdout=PIPE, stderr=self.dev_null)
 
         # Read from stdout of the read dd process
         gzip_process = Popen(['gzip', '-c'],stdin=read_dd_process.stdout, stdout=PIPE, stderr=self.dev_null)
