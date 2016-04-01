@@ -30,6 +30,8 @@ except ImportError:
     skip_progress_bar = 1
 import paramiko
 import logging
+import hashlib
+
 
 
 class CopyFu(object):
@@ -81,9 +83,31 @@ class CopyFu(object):
             self.password = None
             # self.stoprequest = threading.Event()
 
+
+    def generate_file_checksum(self, file, hasher=hashlib.sha256(), blocksize=65536):
+        """ Generate File Checksum. """
+
+        self.hash_type = hasher.name
+        self.remote_hash_cmd = "%ssum" % self.hash_type
+        self.logger.debug("Using Hash Type: %s" % self.hash_type)
+        self.logger.debug("Generating File Check Sum For File: %s" % (self.filename))
+
+
+        file_handle = open(file, 'rb')
+        file_buffer = file_handle.read(blocksize)
+        while len(file_buffer) > 0:
+            hasher.update(file_buffer)
+            file_buffer = file_handle.read(blocksize)
+
+        file_handle.close()
+        self.file_checksum = hasher.hexdigest()
+        self.logger.debug("Check Sum: %s" % (self.file_checksum))
+        return self.file_checksum
+
+
     def _generate_queue_items(self):
         """ Generates List of Offsets """
-
+        self.generate_file_checksum(file=self.filename)
         self.file_size = os.path.getsize(self.filename)
         self.logger.debug("File Size: %s" % self.file_size)
         self.total_blocks = self.file_size / 4096
@@ -100,6 +124,33 @@ class CopyFu(object):
             self.queue.append(offset)
             offset += self.blocks_per_stream
 
+
+    def get_remote_file_checksum(self):
+        """ Get The Remote File Check Sum after Copying """
+        try:
+            ssh_client = paramiko.SSHClient()
+            ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh_client.connect(**self.ssh_args)
+
+            checksum_command = "%s %s" %(self.remote_hash_cmd, self.dest_file)
+            stdin, stdout, stderr = ssh_client.exec_command(checksum_command)
+            self.remote_file_checksum = stdout.read().split()[0]
+            self.logger.debug("Remote File Checksum: %s" % self.remote_file_checksum)
+        finally:
+            ssh_client.close()
+
+    def run(self):
+        """ Run The threading jobs """
+
+        self.start_threads()
+        self.get_remote_file_checksum()
+        # Check if Files have the same checksum
+        if self.file_checksum != self.remote_file_checksum:
+            self.logger.error("File Checksum failed! Does not match")
+            self.logger.error("Local: % Remote: %s" %( self.file_checksum, self.remote_file_checksum))
+        else:
+            self.logger.debug("File Check Sum Passed! Checksum: %s" % self.file_checksum)
+
     def start_threads(self):
         """ Create and Start Threads for Copying """
 
@@ -111,9 +162,8 @@ class CopyFu(object):
                 self.filename, self.file_size, self.dest_file, self.streams, self.blocks_per_stream, self.total_blocks))
 
         pool = []
-        last_item = self.queue[-1]
         for item in self.queue:
-            if last_item == item:
+            if self.queue[-1] == item:
                 pool.append(threading.Thread(target=self.copy, args=(item,)))
             else:
                 pool.append(threading.Thread(target=self.copy, args=(item, self.blocks_per_stream)))
@@ -125,6 +175,11 @@ class CopyFu(object):
                 thread.start()
                 # Need to throttle the ssh connections
                 time.sleep(1)
+
+            # Wait Til All Threads are done
+            for thread in pool:
+                thread.join()
+
         else:
             with click.progressbar(length=len(self.queue * 2), label="%s" % self.dest_file) as bar:
 
@@ -135,15 +190,17 @@ class CopyFu(object):
                     bar.next()
 
                 max_items = len(self.queue)
-                while True:
+                while max_items:
                     try:
-                        if max_items == 0:
-                            break
+                        #if max_items == 0:
+                        #    break
                         self.progress_queue.get(True, 0.05)
                         bar.next()
                         max_items -= 1
                     except Queue.Empty:
                         continue
+
+
 
         self.end_time = time.time()
         temp = self.end_time - self.start_time
@@ -152,8 +209,9 @@ class CopyFu(object):
         temp = temp - 3600 * hours
         minutes = temp // 60
         seconds = temp - 60 * minutes
-        print "Total Number Of Seconds: %s" % temp
-        print('Elapsed Time: %02d:%02d:%02d' % (hours, minutes, seconds))
+        self.logger.debug("Total Number Of Seconds: %s" % temp)
+        self.logger.debug('Elapsed Time: %02d:%02d:%02d' % (hours, minutes, seconds))
+
 
     def copy(self, offset, block_count=-1):
         """ Perform Copy Operation Based on Offset and Block Count"""
@@ -224,4 +282,4 @@ if __name__ == '__main__':
             copyfu_args[arg] = value
 
     copyfu = CopyFu(**copyfu_args)
-    copyfu.start_threads()
+    copyfu.run()
