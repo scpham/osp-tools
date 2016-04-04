@@ -37,6 +37,8 @@ class CopyFu(object):
     def __init__(self, streams=10, **kwargs):
         """Object Init"""
 
+        global skip_progress_bar
+
         self.progress_queue = Queue.Queue()
         self.filename = kwargs.get('filename')
         self.streams = streams
@@ -59,6 +61,7 @@ class CopyFu(object):
 
         self.debug = kwargs.get('debug')
         if self.debug:
+            skip_progress_bar = 1
             self.logger.setLevel(logging.DEBUG)
 
         self.ssh_args = dict(
@@ -157,7 +160,8 @@ class CopyFu(object):
                 self.remote_file_checksum = stdout.read().split()[0]
                 if self.file_checksum == self.remote_file_checksum and not self.force:
                     self.logger.debug("Local file and Remote file checksum are the same: %s" % self.file_checksum)
-                    print "Skipping copy. Local and Remote file checksum are the same: %s" % self.file_checksum
+                    if not skip_progress_bar:
+                        print "Skipping copy. Local and Remote file checksum are the same: %s" % self.file_checksum
                     sys.exit(0)
                 elif self.force:
                     self.logger.debug(
@@ -169,6 +173,8 @@ class CopyFu(object):
                         sys.exit(1)
                 else:
                     self.logger.debug("Remote file exists but no --force option was specified.. Exiting..")
+                    if not skip_progress_bar:
+                        print "Remote file exists but no --force option was specified.. Exiting.."
                     sys.exit(1)
 
         except paramiko.SSHException, e:
