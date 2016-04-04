@@ -33,7 +33,6 @@ import logging
 import hashlib
 
 
-
 class CopyFu(object):
     def __init__(self, streams=10, **kwargs):
         """Object Init"""
@@ -45,6 +44,9 @@ class CopyFu(object):
         self.hostname = kwargs.get('hostname')
         self.dest_file = kwargs.get('destination_file')
         self.ssh_key = kwargs.get('ssh_key')
+        self.force = kwargs.get('force')
+        self.pool = []
+
         self.dev_null = open(os.devnull, 'w')
         log_format = '%(filename)s: %(levelname)s: %(funcName)s(): %(lineno)d:\t %(message)s'
         logging.basicConfig(format=log_format)
@@ -83,6 +85,11 @@ class CopyFu(object):
             self.password = None
             # self.stoprequest = threading.Event()
 
+        ssh_client = paramiko.SSHClient()
+        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh_client.connect(**self.ssh_args)
+
+        self.ssh_client = ssh_client
 
     def generate_file_checksum(self, file, hasher=hashlib.sha256(), blocksize=65536):
         """ Generate File Checksum. """
@@ -91,7 +98,6 @@ class CopyFu(object):
         self.remote_hash_cmd = "%ssum" % self.hash_type
         self.logger.debug("Using Hash Type: %s" % self.hash_type)
         self.logger.debug("Generating File Check Sum For File: %s" % (self.filename))
-
 
         file_handle = open(file, 'rb')
         file_buffer = file_handle.read(blocksize)
@@ -103,7 +109,6 @@ class CopyFu(object):
         self.file_checksum = hasher.hexdigest()
         self.logger.debug("Check Sum: %s" % (self.file_checksum))
         return self.file_checksum
-
 
     def _generate_queue_items(self):
         """ Generates List of Offsets """
@@ -124,44 +129,75 @@ class CopyFu(object):
             self.queue.append(offset)
             offset += self.blocks_per_stream
 
-
     def get_remote_file_checksum(self):
         """ Get The Remote File Check Sum after Copying """
-        try:
-            ssh_client = paramiko.SSHClient()
-            ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh_client.connect(**self.ssh_args)
 
-            checksum_command = "%s %s" %(self.remote_hash_cmd, self.dest_file)
+        try:
+            ssh_client = self.ssh_client
+
+            checksum_command = "%s %s" % (self.remote_hash_cmd, self.dest_file)
             stdin, stdout, stderr = ssh_client.exec_command(checksum_command)
             self.remote_file_checksum = stdout.read().split()[0]
             self.logger.debug("Remote File Checksum: %s" % self.remote_file_checksum)
-        finally:
-            ssh_client.close()
+        except paramiko.SSHException, e:
+            raise e
+
+    def check_remote_file(self):
+        """ Check if the remote file exists """
+
+        try:
+            ssh_client = self.ssh_client
+            checksum_command = "stat %s" % self.dest_file
+            stdin, stdout, stderr = ssh_client.exec_command(checksum_command)
+            if 'No such file or directory' in stderr.read():
+                self.logger.debug("Remote File Does Not Exists.. Performing Copy")
+            else:
+                checksum_command = "%s %s" % (self.remote_hash_cmd, self.dest_file)
+                stdin, stdout, stderr = ssh_client.exec_command(checksum_command)
+                self.remote_file_checksum = stdout.read().split()[0]
+                if self.file_checksum == self.remote_file_checksum and not self.force:
+                    self.logger.debug("Local file and Remote file checksum are the same: %s" % self.file_checksum)
+                    print "Skipping copy. Local and Remote file checksum are the same: %s" % self.file_checksum
+                    sys.exit(0)
+                elif self.force:
+                    self.logger.debug(
+                        "Force option enabled, will remove remote file before copy job. Running 'rm -f %s'" % self.dest_file)
+                    stdin, stdout, stderr = ssh_client.exec_command("rm -f %s" % self.dest_file)
+                    rm_err = stderr.read()
+                    if rm_err:
+                        self.logger.error("Error While Removing File: %s, exiting" % rm_err)
+                        sys.exit(1)
+                else:
+                    self.logger.debug("Remote file exists but no --force option was specified.. Exiting..")
+                    sys.exit(1)
+
+        except paramiko.SSHException, e:
+            raise e
 
     def run(self):
         """ Run The threading jobs """
 
+        self._generate_queue_items()
+        self.check_remote_file()
         self.start_threads()
         self.get_remote_file_checksum()
         # Check if Files have the same checksum
         if self.file_checksum != self.remote_file_checksum:
             self.logger.error("File Checksum failed! Does not match")
-            self.logger.error("Local: % Remote: %s" %( self.file_checksum, self.remote_file_checksum))
+            self.logger.error("Local: % Remote: %s" % (self.file_checksum, self.remote_file_checksum))
         else:
             self.logger.debug("File Check Sum Passed! Checksum: %s" % self.file_checksum)
 
+        self.ssh_client.close()
+
     def start_threads(self):
         """ Create and Start Threads for Copying """
-
-        # Generate Queue Items
-        self._generate_queue_items()
 
         self.logger.debug(
             "Copying File: %s With File Size: %s to Destination File: %s With %s Streams: %s Blocks Per Stream with Total Blocks: %s" % (
                 self.filename, self.file_size, self.dest_file, self.streams, self.blocks_per_stream, self.total_blocks))
 
-        pool = []
+        pool = self.pool
         for item in self.queue:
             if self.queue[-1] == item:
                 pool.append(threading.Thread(target=self.copy, args=(item,)))
@@ -171,7 +207,10 @@ class CopyFu(object):
         # TODO: Need to make sure the print statement isn't done until the thread is completed.
         # TODO: Move the while for bar.next to be more generic
         if self.debug or skip_progress_bar:
+            self.logger.info("Starting copy threads")
             for thread in pool:
+                # Set to daemon threads so we don't need to worry about cleaning up
+                thread.daemon = True
                 thread.start()
                 # Need to throttle the ssh connections
                 time.sleep(1)
@@ -184,6 +223,8 @@ class CopyFu(object):
             with click.progressbar(length=len(self.queue * 2), label="%s" % self.dest_file) as bar:
 
                 for thread in pool:
+                    # Set to daemon threads so we don't need to worry about cleaning up
+                    thread.daemon = True
                     thread.start()
                     # Need to throttle the ssh connections
                     time.sleep(1)
@@ -192,15 +233,13 @@ class CopyFu(object):
                 max_items = len(self.queue)
                 while max_items:
                     try:
-                        #if max_items == 0:
+                        # if max_items == 0:
                         #    break
                         self.progress_queue.get(True, 0.05)
                         bar.next()
                         max_items -= 1
                     except Queue.Empty:
                         continue
-
-
 
         self.end_time = time.time()
         temp = self.end_time - self.start_time
@@ -211,7 +250,6 @@ class CopyFu(object):
         seconds = temp - 60 * minutes
         self.logger.debug("Total Number Of Seconds: %s" % temp)
         self.logger.debug('Elapsed Time: %02d:%02d:%02d' % (hours, minutes, seconds))
-
 
     def copy(self, offset, block_count=-1):
         """ Perform Copy Operation Based on Offset and Block Count"""
@@ -243,18 +281,26 @@ class CopyFu(object):
             stream_stdout, stream_stdin = gzip_process.communicate()
             write_dd_cmd = "%s %s" % ('gzip -dc |', write_dd_cmd)
 
-        ssh_channel.setblocking(0)
-        ssh_channel.exec_command(write_dd_cmd)
-        self.logger.debug("Sending Thread %s %s bytes" % (thread_name, sys.getsizeof(stream_stdout)))
+        try:
+            ssh_channel.setblocking(0)
+            ssh_channel.exec_command(write_dd_cmd)
+            self.logger.debug("Sending Thread %s %s bytes" % (thread_name, sys.getsizeof(stream_stdout)))
 
-        ssh_channel.sendall("%s" % stream_stdout)
-        # Need to call shutdown(2) and recv_exit_status for this to flush all data sent
-        ssh_channel.shutdown(2)
-        self.logger.debug("Thread %s Exit Status %s" % (thread_name, ssh_channel.recv_exit_status()))
+            ssh_channel.sendall("%s" % stream_stdout)
+            # Need to call shutdown(2) and recv_exit_status for this to flush all data sent
+            ssh_channel.shutdown(2)
+            self.logger.debug("Thread %s Exit Status %s" % (thread_name, ssh_channel.recv_exit_status()))
+        except EOFError, e:
+            raise e
+        finally:
+            ssh_client.close()
 
-        ssh_client.close()
+            self.progress_queue.put(block_count)
 
-        self.progress_queue.put(block_count)
+    def clean_up(self):
+        """ Clean up any threads and ssh connections """
+        self.logger.debug("Caught Keyboard Interrupt.. Cleaning up")
+        self.ssh_client.close()
 
 
 if __name__ == '__main__':
@@ -272,6 +318,8 @@ if __name__ == '__main__':
     parser.add_argument('-z', '--nogzip', dest='nogzip', default=False, action='store_true',
                         help='Disable gzip compression')
     parser.add_argument('--debug', dest='debug', action='store_true', help="Show Debug")
+    parser.add_argument('--force', dest='force', default=False, action='store_true',
+                        help='Force removal of remote file if it exists')
 
     args = parser.parse_args()
 
@@ -281,5 +329,8 @@ if __name__ == '__main__':
         if value is not None:
             copyfu_args[arg] = value
 
-    copyfu = CopyFu(**copyfu_args)
-    copyfu.run()
+    try:
+        copyfu = CopyFu(**copyfu_args)
+        copyfu.run()
+    except KeyboardInterrupt, SystemExit:
+        copyfu.clean_up()
