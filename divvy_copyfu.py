@@ -9,7 +9,7 @@ Ported from Kerry Miles (kemiles@cisco.com) divvy_cp.sh
 
 __author__ = 'Scott Pham (scpham@cisco.com)'
 __date__ = '3/11/16'
-__version__ = '0.1'
+__version__ = '0.2'
 # Export Methods
 __all__ = []
 
