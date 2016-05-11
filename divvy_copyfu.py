@@ -4,7 +4,6 @@
 
 Ported from Kerry Miles (kemiles@cisco.com) divvy_cp.sh
 
-
 """
 
 __author__ = 'Scott Pham (scpham@cisco.com)'

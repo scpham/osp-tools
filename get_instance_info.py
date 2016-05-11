@@ -50,6 +50,7 @@ class NovaInstance(object):
         self.dhcp_logs = args.pop('dhcp_logs')
         self.dhcp_ping_test = args.pop('dhcp_ping_test')
         self.capture_tcpdump = args.pop('capture_tcpdump')
+        self.show_console_log = args.pop('show_console_log')
         nova_args = deepcopy(args)
         self._nova = nova_client.Client('2', nova_args.pop('username'),
                                         nova_args.pop('password'),
@@ -99,7 +100,13 @@ class NovaInstance(object):
     def get_instance_info(self, instance_uuid):
         """Get Nova Instance Info (nova show)"""
 
-        instance_data = self._nova.servers.get(instance_uuid).to_dict()
+        instance_object = self._nova.servers.get(instance_uuid)
+
+
+        self.instance_object = instance_object
+
+
+        instance_data = instance_object.to_dict()
 
         if self.debug:
             LOG.debug("Instance Data Dump")
@@ -119,6 +126,7 @@ class NovaInstance(object):
                 flavor = self._nova.flavors.get(flavor_id)
                 instance[field_name] = flavor.name
         return instance_keys, instance
+
 
     def get_instance_floatingip(self, port_id):
         """Get Floating IP of Instance"""
@@ -172,7 +180,7 @@ class NovaInstance(object):
     def get_dhcp_agent_ports(self, network_id, tenant_id):
         """Get DHCP Agent Neutron Ports"""
 
-        dhcp_ports = self._neutron.list_ports(tenant_id=tenant_id, network_id=network_id, device_owner='network:dhcp')
+        dhcp_ports = self._neutron.list_ports(network_id=network_id,device_owner='network:dhcp')
         LOG.debug("DHCP Agent Port Dump")
         self.data_dump(dhcp_ports)
 
@@ -340,6 +348,11 @@ class NovaInstance(object):
                     jobs_not_performed_table.add_row([job])
 
                 print jobs_not_performed_table
+
+            if self.show_console_log:
+                header = '[%s] Console Log' % instance['name']
+                print "================================== " + header + " =========================================="
+                print self.instance_object.get_console_output()
 
 
     @staticmethod
@@ -628,6 +641,7 @@ if __name__ == '__main__':
                         help="Grab DHCP Logs for Instance MAC")
     parser.add_argument('--dhcp-ping-test', '--ping-test', dest='dhcp_ping_test', action='store_true',
                         help="Performs Ping Test inside DHCP Namespace")
+    parser.add_argument('--show-console-log',dest='show_console_log', default=False, action='store_true', help='Shows Instance Console Log')
     parser.add_argument('--capture-tcpdump', dest='capture_tcpdump', action='store_true',
                         help="Runs TCP Dump on Compute node and captures it's output. This takes about 10 seconds to perform")
 
@@ -643,7 +657,8 @@ if __name__ == '__main__':
                    ovs_data=args.ovs_data,
                    dhcp_logs=args.dhcp_logs,
                    dhcp_ping_test=args.dhcp_ping_test,
-                   capture_tcpdump=args.capture_tcpdump)
+                   capture_tcpdump=args.capture_tcpdump,
+                   show_console_log=args.show_console_log)
 
     nova_instance = NovaInstance(**os_args)
     nova_instance.print_instance_info(args.uuid)
